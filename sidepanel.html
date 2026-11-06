@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Image Harvester</title>
+  <link rel="stylesheet" href="sidepanel.css">
+</head>
+<body>
+  <header class="top">
+    <div class="page">
+      <div id="pageTitle" class="title">No page</div>
+      <div id="pageHost" class="host"></div>
+    </div>
+    <div class="actions">
+      <button id="btnRescan" title="Scan the page again for new images">Rescan</button>
+      <button id="btnScroll" title="Scroll through the page so lazy-loaded images load">Auto-scroll</button>
+    </div>
+  </header>
+
+  <div id="status" class="status"></div>
+
+  <details class="panel" id="filtersPanel" open>
+    <summary>Filters <button class="link" id="btnReset" type="button">Reset</button></summary>
+    <div class="row">
+      <label for="minW">Min size</label>
+      <div class="pair">
+        <input type="number" id="minW" min="0" step="10" aria-label="Minimum width"> <span>×</span>
+        <input type="number" id="minH" min="0" step="10" aria-label="Minimum height"> <span>px</span>
+      </div>
+    </div>
+    <div class="row">
+      <label for="minKB">File size</label>
+      <div class="pair">
+        <input type="number" id="minKB" min="0" step="10" aria-label="Minimum file size in KB"> <span>–</span>
+        <input type="number" id="maxKB" min="0" step="10" placeholder="any" aria-label="Maximum file size in KB"> <span>KB</span>
+      </div>
+    </div>
+    <div class="row">
+      <label for="shape">Shape</label>
+      <select id="shape">
+        <option value="any">Any</option>
+        <option value="landscape">Landscape</option>
+        <option value="portrait">Portrait</option>
+        <option value="square">Square-ish</option>
+      </select>
+    </div>
+    <div class="row">
+      <label>Types</label>
+      <div class="chips" id="types"></div>
+    </div>
+    <div class="row">
+      <label for="urlInclude">URL has</label>
+      <input type="text" id="urlInclude" placeholder="words or /regex/" spellcheck="false">
+    </div>
+    <div class="row">
+      <label for="urlExclude">URL not</label>
+      <input type="text" id="urlExclude" placeholder="e.g. avatar logo sprite" spellcheck="false">
+    </div>
+  </details>
+
+  <details class="panel" open>
+    <summary>Duplicates</summary>
+    <label class="check"><input type="checkbox" id="dedup"> Keep only the best copy of similar images</label>
+    <div class="row">
+      <label for="threshold">Match</label>
+      <div class="range">
+        <input type="range" id="threshold" min="0" max="20" step="1">
+        <span id="thresholdLabel"></span>
+      </div>
+    </div>
+    <label class="check"><input type="checkbox" id="showDupes"> Show the removed copies</label>
+  </details>
+
+  <div class="toolbar">
+    <select id="sort" aria-label="Sort">
+      <option value="page">Page order</option>
+      <option value="pixels">Largest first</option>
+      <option value="bytes">Biggest file first</option>
+    </select>
+    <span class="spacer"></span>
+    <span class="muted">Select</span>
+    <button class="link" id="selAll" type="button">all</button>
+    <button class="link" id="selNone" type="button">none</button>
+  </div>
+
+  <main id="grid" class="grid"></main>
+  <div id="empty" class="empty"></div>
+
+  <footer class="bottom">
+    <div id="selInfo" class="sel-info"></div>
+    <div class="actions">
+      <button id="btnFiles" title="Save each image as a separate file in a folder">Save files</button>
+      <button id="btnZip" class="primary" title="Download the selected images as one ZIP">Download ZIP</button>
+    </div>
+  </footer>
+
+  <script src="lib/phash.js"></script>
+  <script src="lib/zip.js"></script>
+  <script src="lib/inject.js"></script>
+  <script src="sidepanel.js"></script>
+</body>
+</html>
