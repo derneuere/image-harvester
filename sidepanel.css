@@ -126,6 +126,7 @@ input:focus-visible, select:focus-visible, button:focus-visible { outline: 2px s
 .check { display: flex; align-items: center; gap: 6px; margin: 6px 0; cursor: pointer; }
 .check input { accent-color: var(--accent); margin: 0; }
 .check.disabled, .row.disabled { opacity: 0.5; }
+.hint { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
 
 .chips { display: flex; flex-wrap: wrap; gap: 4px; }
 .chip { position: relative; }

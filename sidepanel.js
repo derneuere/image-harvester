@@ -1,5 +1,5 @@
 'use strict';
-/* global PHash, Zip, pageScan, pageAutoScroll, pageStopScroll, pageFetch */
+/* global PHash, Zip, LinkPage, pageScan, pageAutoScroll, pageStopScroll, pageFetch */
 
 const $ = (id) => document.getElementById(id);
 
@@ -15,11 +15,17 @@ const DEFAULTS = {
   types: Object.fromEntries(TYPES.map((t) => [t, true])),
   urlInclude: '', urlExclude: '',
   dedup: true, threshold: 6, showDupes: false, sort: 'page',
+  followLinks: false, followExternal: false,
 };
 const CONCURRENCY = 6;        // parallel fetches
 const DECODE_CONCURRENCY = 2; // full-size decodes held in memory at once
 const THUMB = 240;            // thumbnail size (longest side, px)
 const MAX_ITEMS = 5000;
+const LINK_CONCURRENCY = 3;   // linked pages fetched at once
+const MAX_LINKS = 300;        // linked pages followed per tab
+const LINK_MATCH = 10;        // max pHash bits between thumbnail and full image
+// Never follow links that could change something or count as an ad click.
+const UNSAFE_LINK = /log-?out|sign-?out|log-?off|delete|remove|unsubscribe|add-?to-?cart|checkout|vote|doubleclick|googleadservices|googlesyndication|adservice|\/aclk|adclick|\/click\?/i;
 const REFERER_RULE_ID = 1;
 
 const state = {
@@ -35,6 +41,9 @@ const state = {
   order: 0,
   queue: [],
   active: 0,
+  links: new Map(),    // href -> link (a thumbnail wrapped in a link)
+  linkQueue: [],
+  linkActive: 0,
   deselected: new Set(),
   cards: new Map(),
   settings: structuredClone(DEFAULTS),
@@ -121,6 +130,8 @@ function resetItems() {
   for (const it of state.items.values()) if (it.thumbUrl) URL.revokeObjectURL(it.thumbUrl);
   state.items.clear();
   state.queue.length = 0;
+  state.links.clear();
+  state.linkQueue.length = 0;
   state.cards.clear();
   state.deselected.clear();
   state.order = 0;
@@ -187,7 +198,11 @@ async function scan() {
       func: pageScan,
     });
     if (gen !== state.gen) return;
-    for (const r of results || []) if (r && r.result) addItems(r.result.images);
+    for (const r of results || []) {
+      if (!r || !r.result) continue;
+      addItems(r.result.images);
+      addLinks(r.result.links || []);
+    }
     state.scanError = '';
   } catch (e) {
     if (gen !== state.gen) return;
@@ -240,13 +255,17 @@ function addItems(entries) {
     if (!e || !e.url) continue;
     // Inline data: URLs can be megabytes long; key them by a short hash instead,
     // and drop the string itself once the image has been processed.
-    let key = e.url;
-    let dataUrl = e.dataUrl;
-    if (key.startsWith('data:')) {
-      dataUrl = key;
-      key = 'inline:' + fnv1a(key) + '-' + key.length;
+    const key = keyOf(e.url);
+    const dataUrl = e.url.startsWith('data:') ? e.url : e.dataUrl;
+    const existing = state.items.get(key);
+    if (existing) {
+      // Found on the page itself after a linked page suggested it: no longer a guess.
+      if (existing.tentative && !(e.extra && e.extra.tentative)) {
+        existing.tentative = false;
+        added = true;
+      }
+      continue;
     }
-    if (state.items.has(key)) continue;
     if (state.items.size >= MAX_ITEMS) break;
     const item = {
       url: key,
@@ -254,6 +273,7 @@ function addItems(entries) {
       source: e.source,
       order: state.order++,
       status: 'pending',
+      ...(e.extra || {}),
     };
     state.items.set(key, item);
     state.queue.push(item);
@@ -278,6 +298,218 @@ function pump() {
 
 const isCurrent = (item) => state.items.get(item.url) === item;
 
+function keyOf(url) {
+  return url.startsWith('data:') ? 'inline:' + fnv1a(url) + '-' + url.length : url;
+}
+
+// ---------------------------------------------------------------- following links
+//
+// Many galleries show a thumbnail that links to the full-size image, either
+// directly or through a "viewer" page. When "Follow links" is on, each such link
+// is fetched: an image response is the full-size version; an HTML page is
+// searched for candidates (og:image, links to image files, large <img>s).
+// A candidate is kept only if its pHash matches the thumbnail (also checking a
+// centered crop, for square thumbnails of wide photos). If nothing matches, the
+// page's og:image is kept as a best guess. Everything else is thrown away.
+
+function siteOf(host) {
+  const parts = host.split('.');
+  if (parts.length <= 2 || /^\d+$/.test(parts[parts.length - 1])) return host;
+  const sld = parts[parts.length - 2];
+  return parts.slice(sld.length <= 3 ? -3 : -2).join('.'); // e.g. bbc.co.uk
+}
+
+function shouldFollow(href) {
+  if (UNSAFE_LINK.test(href)) return false;
+  if (state.settings.followExternal) return true;
+  try {
+    return siteOf(new URL(href).hostname) === siteOf(state.host);
+  } catch {
+    return false;
+  }
+}
+
+function addLinks(list) {
+  for (const l of list) {
+    let link = state.links.get(l.href);
+    if (!link) {
+      if (state.links.size >= MAX_LINKS) break;
+      link = { href: l.href, thumbKeys: new Set(), status: 'new', cands: null, resolved: false };
+      state.links.set(l.href, link);
+    }
+    for (const t of l.thumbs) link.thumbKeys.add(keyOf(t));
+  }
+  queueLinks();
+}
+
+function queueLinks() {
+  if (!state.settings.followLinks) return;
+  for (const link of state.links.values()) {
+    if (link.status !== 'new') continue;
+    if (!shouldFollow(link.href)) {
+      link.status = 'skipped';
+      continue;
+    }
+    link.status = 'queued';
+    state.linkQueue.push(link);
+  }
+  pumpLinks();
+  scheduleRender();
+}
+
+function unqueueLinks() {
+  for (const link of state.linkQueue) link.status = 'new';
+  state.linkQueue.length = 0;
+  // Skipped links may be allowed after a settings change.
+  for (const link of state.links.values()) if (link.status === 'skipped') link.status = 'new';
+}
+
+function pumpLinks() {
+  while (state.linkActive < LINK_CONCURRENCY && state.linkQueue.length) {
+    const link = state.linkQueue.shift();
+    state.linkActive++;
+    followLink(link).finally(() => {
+      state.linkActive--;
+      pumpLinks();
+      scheduleRender();
+    });
+  }
+}
+
+async function followLink(link) {
+  const gen = state.gen;
+  link.status = 'loading';
+  try {
+    const r = await fetch(link.href, { credentials: 'include', redirect: 'follow' });
+    if (gen !== state.gen) return;
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const type = (r.headers.get('content-type') || '').toLowerCase();
+    const finalUrl = r.url || link.href;
+    let cands = [];
+    if (type.startsWith('image/')) {
+      // The link itself is the full-size image.
+      cands = [{ url: finalUrl, kind: 'direct', blob: await r.blob() }];
+    } else if (type.includes('html')) {
+      if (+r.headers.get('content-length') > 5e6) throw new Error('page too large');
+      cands = LinkPage.extract(await r.text(), finalUrl);
+    }
+    if (gen !== state.gen) return;
+    await waitForThumbs(link, gen);
+    if (gen !== state.gen) return;
+    addCandidates(link, cands);
+    link.status = 'done';
+  } catch (e) {
+    link.status = 'error';
+    link.error = String((e && e.message) || e);
+    link.resolved = true;
+  }
+}
+
+// Candidates are hashed with the thumbnails' aspect ratios in mind, so wait
+// until the thumbnails themselves have been processed.
+async function waitForThumbs(link, gen) {
+  const start = Date.now();
+  while (gen === state.gen && Date.now() - start < 30000) {
+    const pending = [...link.thumbKeys].some((k) => {
+      const t = state.items.get(k);
+      return t && t.status === 'pending';
+    });
+    if (!pending) return;
+    await new Promise((r) => setTimeout(r, 250));
+  }
+}
+
+function addCandidates(link, cands) {
+  const aspects = [];
+  for (const k of link.thumbKeys) {
+    const t = state.items.get(k);
+    if (t && t.status === 'ok' && !aspects.some((a) => Math.abs(a - t.logAspect) < 0.02)) aspects.push(t.logAspect);
+  }
+  link.cands = [];
+  const entries = [];
+  for (const c of cands) {
+    const key = keyOf(c.url);
+    link.cands.push(key);
+    const existing = state.items.get(key);
+    if (existing) {
+      if (existing.linkHrefs) existing.linkHrefs.add(link.href);
+      continue;
+    }
+    const direct = c.kind === 'direct';
+    entries.push({
+      url: c.url,
+      source: direct ? 'link to full-size image' : 'linked page (' + c.kind + ')',
+      extra: {
+        tentative: !direct,
+        meta: c.kind === 'meta',
+        linkHrefs: new Set([link.href]),
+        prefetched: c.blob,
+        cropAspects: aspects,
+      },
+    });
+  }
+  addItems(entries);
+}
+
+function thumbMatch(c, t) {
+  if (Math.abs(c.logAspect - t.logAspect) <= 0.15) return PHash.distance(c.hash, t.hash) <= LINK_MATCH;
+  const crop = (c.cropHashes || []).find((x) => Math.abs(x.logAspect - t.logAspect) < 0.02);
+  return !!crop && PHash.distance(crop.hash, t.hash) <= LINK_MATCH;
+}
+
+/** Decide which candidates from followed links to keep, and free the rest. */
+function resolveLinks() {
+  for (const link of state.links.values()) {
+    if (link.resolved || !link.cands) continue;
+    const cands = link.cands.map((k) => state.items.get(k)).filter(Boolean);
+    if (cands.some((c) => c.status === 'pending')) continue;
+    const thumbs = [...link.thumbKeys].map((k) => state.items.get(k)).filter((t) => t && t.status === 'ok');
+    let matched = false;
+    for (const c of cands) {
+      if (c.status !== 'ok') continue;
+      const hits = thumbs.filter((t) => t !== c && thumbMatch(c, t));
+      if (!hits.length) continue;
+      matched = true;
+      c.accepted = true;
+      c.matchedThumbs = c.matchedThumbs || new Set();
+      hits.forEach((t) => c.matchedThumbs.add(t.url));
+    }
+    if (!matched) {
+      const guess = cands.find((c) => c.status === 'ok' && c.meta);
+      if (guess) guess.accepted = true;
+    }
+    link.resolved = true;
+  }
+  for (const it of state.items.values()) {
+    if (!it.tentative || it.accepted || it.status !== 'ok') continue;
+    const open = [...it.linkHrefs].some((h) => {
+      const l = state.links.get(h);
+      return l && !l.resolved;
+    });
+    if (open) continue;
+    // Not the picture we were looking for: free its memory.
+    it.status = 'unmatched';
+    if (it.thumbUrl) URL.revokeObjectURL(it.thumbUrl);
+    it.thumbUrl = null;
+    it.blob = null;
+  }
+}
+
+function linkStats() {
+  let total = 0;
+  let done = 0;
+  for (const l of state.links.values()) {
+    if (l.status === 'new' || l.status === 'skipped') continue;
+    total++;
+    if (l.status === 'done' || l.status === 'error') done++;
+  }
+  let found = 0;
+  for (const it of state.items.values()) {
+    if (it.linkHrefs && it.status === 'ok' && (!it.tentative || it.accepted)) found++;
+  }
+  return { total, done, found, busy: state.linkActive > 0 || state.linkQueue.length > 0 };
+}
+
 // Memory notes:
 // - The original file is kept only as a Blob. Chrome stores Blob data outside
 //   the page's JS heap and can move it to disk when memory is tight.
@@ -297,7 +529,7 @@ async function processItem(item) {
     const blob = raw.slice(0, raw.size, MIME[type]); // fix the MIME type without copying
     delete item.dataUrl;
     const crc = await crcOfBlob(blob);
-    const pic = await withDecodeSlot(() => analyze(blob, type));
+    const pic = await withDecodeSlot(() => analyze(blob, type, item.cropAspects));
     thumbUrl = pic.thumbUrl;
     if (!isCurrent(item)) return;
 
@@ -311,6 +543,7 @@ async function processItem(item) {
       height: pic.height,
       logAspect: Math.log(pic.width / pic.height),
       hash: pic.hash,
+      cropHashes: pic.cropHashes,
       crc,
       exact: blob.size + ':' + crc, // same size + same CRC = same file
     });
@@ -340,7 +573,7 @@ async function withDecodeSlot(fn) {
 }
 
 /** Decodes once, returns size, pHash and a thumbnail URL, then frees the decode. */
-async function analyze(blob, type) {
+async function analyze(blob, type, cropAspects) {
   let src;
   let width;
   let height;
@@ -366,10 +599,16 @@ async function analyze(blob, type) {
   try {
     if (!width || !height) throw new Error('image has no size');
     const hash = PHash.fromImage(src);
+    // Extra hashes of centered crops, to recognise a square (etc.) thumbnail of this image.
+    const cropHashes = [];
+    for (const a of cropAspects || []) {
+      if (Math.abs(a - Math.log(width / height)) <= 0.15) continue;
+      cropHashes.push({ logAspect: a, hash: PHash.fromImage(src, PHash.centerCrop(width, height, Math.exp(a))) });
+    }
 
     // Small files and SVGs are their own thumbnail.
     if (type === 'svg' || (Math.max(width, height) <= THUMB && blob.size < 64 * 1024)) {
-      return { width, height, hash, thumbUrl: URL.createObjectURL(blob) };
+      return { width, height, hash, cropHashes, thumbUrl: URL.createObjectURL(blob) };
     }
     const scale = Math.min(1, THUMB / Math.max(width, height));
     const tw = Math.max(1, Math.round(width * scale));
@@ -380,7 +619,7 @@ async function analyze(blob, type) {
     ctx.imageSmoothingQuality = 'high';
     ctx.drawImage(src, 0, 0, tw, th);
     const thumb = await canvas.convertToBlob({ type: 'image/webp', quality: 0.8 });
-    return { width, height, hash, thumbUrl: URL.createObjectURL(thumb) };
+    return { width, height, hash, cropHashes, thumbUrl: URL.createObjectURL(thumb) };
   } finally {
     if (src.close) src.close(); // release the full-size ImageBitmap now
   }
@@ -407,6 +646,11 @@ function fnv1a(str) {
 }
 
 async function fetchBlob(item) {
+  if (item.prefetched) {
+    const b = item.prefetched;
+    delete item.prefetched;
+    return b;
+  }
   const src = item.dataUrl || item.url;
   if (src.startsWith('data:')) return (await fetch(src)).blob();
 
@@ -501,9 +745,13 @@ function computeView() {
   const s = state.settings;
   const all = [...state.items.values()];
   let pending = 0;
+  let total = 0;
   const errors = [];
   const ok = [];
   for (const it of all) {
+    // Candidates from followed links only count once they match a thumbnail.
+    if (it.linkHrefs && it.tentative && !it.accepted) continue;
+    total++;
     if (it.status === 'ok') ok.push(it);
     else if (it.status === 'error') errors.push(it);
     else pending++;
@@ -557,6 +805,16 @@ function computeView() {
         if (PHash.distance(a.hash, b.hash) <= s.threshold) union(i, j);
       }
     }
+    // A full-size image found through a link replaces the thumbnail that linked
+    // to it, even when the thumbnail is a crop with a different shape.
+    const index = new Map(filtered.map((it, i) => [it.url, i]));
+    filtered.forEach((it, i) => {
+      if (!it.matchedThumbs) return;
+      for (const k of it.matchedThumbs) {
+        const j = index.get(k);
+        if (j !== undefined) union(j, i);
+      }
+    });
   }
 
   const groups = new Map();
@@ -575,7 +833,7 @@ function computeView() {
   else if (s.sort === 'bytes') kept.sort((a, b) => b.item.bytes - a.item.bytes);
   else kept.sort((a, b) => a.first - b.first);
 
-  return { total: all.length, pending, errors, ok: ok.length, filtered: n, kept };
+  return { total, pending, errors, ok: ok.length, filtered: n, kept };
 }
 
 function selectedItems() {
@@ -595,6 +853,7 @@ function scheduleRender() {
 }
 
 function render() {
+  resolveLinks();
   const v = computeView();
   state.view = v;
   const s = state.settings;
@@ -619,6 +878,9 @@ function render() {
     if (s.dedup && removed) t += ` · ${removed} duplicate${removed === 1 ? '' : 's'} removed`;
     if (v.pending) t += ` · loading ${v.pending}…`;
     else if (state.scanning) t += ' · scanning…';
+    const ls = linkStats();
+    if (ls.busy) t += ` · following links ${ls.done}/${ls.total}…`;
+    else if (ls.total) t += ` · ${ls.found} full-size via links`;
     text(t);
     if (v.errors.length) {
       text(' · ');
@@ -874,10 +1136,28 @@ function syncControls() {
   $('threshold').closest('.row').classList.toggle('disabled', off);
   $('showDupes').disabled = off;
   $('showDupes').closest('.check').classList.toggle('disabled', off);
+  $('followLinks').checked = s.followLinks;
+  $('followExternal').checked = s.followExternal;
+  $('followExternal').disabled = !s.followLinks;
+  $('followExternal').closest('.check').classList.toggle('disabled', !s.followLinks);
 }
 
 function bindControls() {
   const s = () => state.settings;
+
+  $('followLinks').addEventListener('change', () => {
+    s().followLinks = $('followLinks').checked;
+    if (s().followLinks) queueLinks();
+    else unqueueLinks();
+    syncControls();
+    saveSettings();
+  });
+  $('followExternal').addEventListener('change', () => {
+    s().followExternal = $('followExternal').checked;
+    unqueueLinks();
+    queueLinks();
+    saveSettings();
+  });
 
   const types = $('types');
   for (const t of TYPES) {
@@ -930,7 +1210,9 @@ function bindControls() {
   });
   $('btnReset').addEventListener('click', (e) => {
     e.preventDefault(); // don't toggle the <details>
-    state.settings = structuredClone(DEFAULTS);
+    // Reset only resets the filters; link settings stay as they are.
+    const { followLinks, followExternal } = state.settings;
+    state.settings = { ...structuredClone(DEFAULTS), followLinks, followExternal };
     syncControls();
     saveSettings();
   });

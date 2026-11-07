@@ -47,6 +47,9 @@ uses, and keeps only the highest-quality one.
     files, `og:image`, video posters, inline SVG, `<canvas>`, and `blob:` images
   - Works across iframes and open shadow DOM
   - **Auto-scroll** scrolls the page to trigger lazy loading and infinite scroll
+- **Follows thumbnail links** (optional): when a thumbnail opens the full-size
+  image on a separate page, Image Harvester opens that page in the background
+  and keeps only the image that matches the thumbnail
 - **Filters:** minimum width and height, file size range, shape
   (landscape/portrait/square), file type, and URL include/exclude with plain
   words or a `/regex/`
@@ -89,8 +92,10 @@ card.
 2. Click **Auto-scroll** on long or lazy-loading pages. It scrolls through the
    page, then rescans. Click again to stop.
 3. Adjust the filters. The grid updates as you type.
-4. Click a thumbnail to deselect it. Use ↗ to open the original image.
-5. Click **Download ZIP** or **Save files**.
+4. On galleries where you click a thumbnail to see the full-size image, turn
+   on **Follow links on thumbnails**.
+5. Click a thumbnail to deselect it. Use ↗ to open the original image.
+6. Click **Download ZIP** or **Save files**.
 
 A badge like **+3** on a thumbnail means three smaller or identical copies
 were merged into it. Turn on **Show the removed copies** to see them.
@@ -114,6 +119,31 @@ similar aspect ratio, so a square crop isn't mistaken for the full photo.
 In testing, resized and re-encoded copies were 0–2 bits apart, and different
 pictures were 20 or more apart.
 
+## How link following works
+
+Many galleries show small thumbnails that link to the real image, either
+directly or through a viewer page. With **Follow links on thumbnails** on:
+
+1. Every link that wraps a thumbnail is collected.
+2. Each link is fetched in the background, three at a time and at most 300 per
+   page.
+   - If it returns an image, that's the full-size version.
+   - If it returns a web page, the page is searched for candidates: its
+     `og:image` / `twitter:image`, links to image files, and the largest
+     `<img>` (using its biggest `srcset` size). Pages are only read, never run.
+3. A candidate is kept only if its perceptual hash matches the thumbnail.
+   Square thumbnails of wide photos are compared against a centered crop.
+   Logos, ads and "related photos" on the viewer page are dropped and their
+   memory is freed.
+4. If nothing matches, the page's `og:image` is kept as a best guess.
+5. The full-size image replaces its thumbnail in the grid.
+
+For safety:
+- Only links on the same site are followed, unless you also turn on **Also
+  follow links to other sites**.
+- Links that look like logout, delete, unsubscribe, cart, checkout, vote or ad
+  clicks are never opened.
+
 ## Permissions
 
 | Permission | Why it's needed |
@@ -133,7 +163,8 @@ manifest.json      Extension manifest (MV3)
 background.js      Records images loaded by each tab
 sidepanel.html/css/js  The interface: fetching, hashing, filters, dedup, downloads
 lib/inject.js      Page scanner, auto-scroll and in-page fetch (run inside the tab)
-lib/phash.js       Perceptual hash (DCT pHash) and Hamming distance
+lib/linkpage.js    Finds full-size image candidates on a linked page
+lib/phash.js       Perceptual hash (DCT pHash), crops and Hamming distance
 lib/zip.js         Small ZIP writer that stores files without recompressing
 icons/             Toolbar and store icons
 ```
@@ -151,6 +182,10 @@ No build step and no dependencies: edit a file and reload the extension.
 - If your browser asks where to save each download, **Save files** shows one
   dialog per image. Use the ZIP instead.
 - Animated GIFs get a still thumbnail, but they download intact.
+- Link following only works for real links (`<a href>`). Lightboxes that open
+  the full-size image with JavaScript only, without a link, can't be followed.
+  Their full-size image is often still caught by the network capture once you
+  open one.
 
 ## License
 
